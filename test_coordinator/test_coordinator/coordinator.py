@@ -1,16 +1,15 @@
 import rclpy
 from rclpy.node import Node
 from test_interfaces.srv import RequestAllocation  # Custom service with robot_id and float array
-from functools import partial
+
 import numpy as np
-from scipy.optimize import minimize
 from test_interfaces.msg import TaskAllocation
 from concurrent.futures import ThreadPoolExecutor
 import yaml
-from tqdm import tqdm
+from MRTAALwTL.coordinator import Coordinator
 
 
-class Coordinator(Node):
+class CoordinatorROS(Node):
     def __init__(self):
         super().__init__(
             "coordinator",
@@ -26,6 +25,8 @@ class Coordinator(Node):
         self.des_probs = [task["desired satisfaction probability"]
                           for task in config['TWTL constraint']['tasks'].values()]
         self.num_tasks = len(self.des_probs)
+
+        self.coordinator = Coordinator(self.num_robots, self.num_tasks, self.des_probs)
 
         self.episode = 0
         self.received_values = {}  # Store values from each robot by ID
@@ -115,57 +116,8 @@ class Coordinator(Node):
         """
         values = np.array([[v for v in self.received_values[i]] for i in range(self.num_robots)])
         probabilities = np.array([[p for p in self.received_probs[i]] for i in range(self.num_robots)])
-        # print(values)
-        # print(probabilities)
-        # values = np.array([[0., 0., ]])
-        # probabilities = np.array([[0.99922818, 0.99966264, ]])
-        # Number of decision variables: n_robot * (n_task + 1)
-        n_vars = self.num_robots * (self.num_tasks + 1)
 
-        # Flatten initial guess for decision variables (starting with equal distribution)
-        x0 = np.ones(n_vars) / (self.num_tasks + 1)
-
-        # Objective function (maximize sum(x[i, j] * values[i, j]), so minimize the negative)
-        def objective(x):
-            x = np.array(x).reshape(self.num_robots, self.num_tasks + 1)  # Reshape x into a 2D array
-            return -np.sum(x * values)
-
-        # Row sum constraint: sum of probabilities for each robot across all tasks equals 1
-        def row_sum_constraint(x, i):
-            x = np.array(x).reshape(self.num_robots, self.num_tasks + 1)  # Reshape x into a 2D array
-            return np.sum(x[i, :]) - 1  # Sum over all tasks for robot i
-
-        # Nonlinear column probability constraint
-        def col_pr_constraint(x, j):
-            x = np.array(x).reshape(self.num_robots, self.num_tasks + 1)  # Reshape x into a 2D array
-            if j < self.num_tasks:
-                product = np.prod(1 - x[:, j] * probabilities[:, j])
-                return 1 - product - self.des_probs[j]
-            else:
-                return 0  # No constraint for the extra task
-
-        # Create constraint dictionaries for minimize function
-        cons = []
-
-        # Add row sum constraints (equality)
-        for i in range(self.num_robots):
-            cons.append({'type': 'eq', 'fun': partial(row_sum_constraint, i=i)})
-
-        # Add column probability constraints (inequality)
-        for j in range(self.num_tasks):
-            cons.append({'type': 'ineq', 'fun': partial(col_pr_constraint, j=j)})
-
-        # Define bounds (between 0 and 1 for each variable)
-        bounds = [(0, 1) for _ in range(n_vars)]
-
-        # Solve the problem using SLSQP solver from scipy.optimize.minimize
-        result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons)
-
-        # Extract solution and reshape back into the robot-task matrix
-        x_values = np.reshape(result.x, (self.num_robots, self.num_tasks + 1))
-
-        # Check if the constraints are satisfied (if optimization succeeded)
-        constraint_satisfied = result.success
+        x_values, constraint_satisfied = self.coordinator.compute_prob(values, probabilities)
 
         if not constraint_satisfied:
             self.get_logger().info(f'Probability: {probabilities}; values: {values}')
@@ -177,7 +129,7 @@ class Coordinator(Node):
 def main(args=None):
     rclpy.init(args=args)
     try:
-        coordinator = Coordinator()
+        coordinator = CoordinatorROS()
         rclpy.spin(coordinator)
     except Exception as exception:
         raise exception
