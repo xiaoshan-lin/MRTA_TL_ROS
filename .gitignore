@@ -150,3 +150,6 @@ result/
 # output/
 # data/
 *.xls
+
+__pycache__/
+*.pyc
