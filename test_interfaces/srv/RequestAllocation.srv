@@ -1,0 +1,7 @@
+int32 robot_id        # The ID of the robot
+int32 episode         # The current episode #
+float32[] robot_values  # Dynamic-length array of float values
+float32[] robot_probs
+---
+bool accepted          # Response accepted flag
+string message        # Response message
