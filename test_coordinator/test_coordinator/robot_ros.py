@@ -1,7 +1,8 @@
 import rclpy
 from rclpy.node import Node
 from test_interfaces.msg import TaskAllocation
-from test_interfaces.srv import RequestAllocation  # Assuming RobotTask service exists
+from std_msgs.msg import String
+from test_interfaces.srv import RequestAllocation, SendData  # Assuming RobotTask service exists
 import numpy as np
 from MRTAALwTL.robot import Robot
 import yaml
@@ -14,6 +15,7 @@ class RobotROS(Node):
         self.num_robots = self.robot.num_robots
         self.num_tasks = self.robot.num_tasks
         self.client = self.create_client(RequestAllocation, 'send_values')
+        self.data_client = self.create_client(SendData, 'send_data')
 
         # Subscriber to listen to the task allocation
         self.subscription = self.create_subscription(
@@ -22,20 +24,42 @@ class RobotROS(Node):
             self.task_allocation_callback,
             10)
 
+        self.string_subscription = self.create_subscription(
+            String,
+            'proj_dir',
+            self.pickle_callback,
+            10)
+
         # Wait for the coordinator’s service to be available
         while not self.client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Waiting for coordinator service to be available...')
 
-        self.get_logger().info('Connected to coordinator service')
-        values, probs = self.robot.get_values_and_probs()
-        self.send_values(values, probs)
+        while not self.data_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for service...')
 
-    def send_values(self, values, probs):
+        self.get_logger().info('Connected to coordinator service')
+
+        self.send_values()
+
+    def pickle_callback(self, msg):
+        proj_dir = msg.data
+        self.robot.pickle(proj_dir)
+        self.get_logger().info(f'Robot {self.robot.robot_id} received project dir')
+
+    def send_values(self):
+        values, probs, backup_probs = self.robot.get_values_and_probs()
+
+        # self.get_logger().info(f'mdp:{self.robot.current_mdp_state}')
+        # self.get_logger().info(f'lb: {self.robot.estimator.lower_bound[0][self.robot.current_mdp_state]}')
+        # a = self.robot.estimator.result_count[0][self.robot.current_mdp_state]['number']
+        # self.get_logger().info(f'lb: {a}')
+
         request = RequestAllocation.Request()
         request.robot_id = self.robot.robot_id
         request.episode = self.robot.current_episode
         request.robot_values = values
         request.robot_probs = probs
+        request.backup_probs = backup_probs
         self.client.call_async(request)  # Asynchronously send the service request
 
     def task_allocation_callback(self, msg):
@@ -51,17 +75,39 @@ class RobotROS(Node):
             task = np.random.choice(self.num_tasks + 1, p=probs)
 
             # Process the task allocation with the Robot class
-            stop, values, probs = self.robot.execute(task)
+            status = self.robot.execute(task)
 
-            if stop:
-                self.get_logger().info('Reached the desired learning episode, terminating the node.')
-                # self.destroy_node()  # Cleanly stop the node
-                # rclpy.shutdown()  # Shutdown ROS2
+            # self.get_logger().info(f'mdp: {self.robot.current_mdp_state}')
+            # self.get_logger().info(f'lb: {self.robot.estimator.lower_bound[0][self.robot.current_mdp_state]}')
+
+            if status == 'Continue':
+                self.send_values()
+
             else:
-                self.send_values(values, probs)
-
+                self.send_results()
+                if status == 'Episode end':
+                    self.get_logger().info(f'Reached the desired learning episode for iteration {self.robot.repeat_count}')
+                    self.reset()
+                    self.send_values()
+                else:
+                    self.get_logger().info(f'Reached the desired learning episode for {self.robot.repeat_iters} iterations')
         else:
             raise RuntimeError("Unalbe to find feasible task allocation.")
+
+    def reset(self):
+        self.robot.reset()
+
+    def send_results(self):
+        ep_rewards, twtl_sat = self.robot.get_results()
+        flattened_twtl_sat = [item for sublist in twtl_sat for item in sublist]
+
+        request = SendData.Request()
+        request.repeat_count = self.robot.repeat_count - 1 # TODO
+        request.robot_id = self.robot.robot_id
+        request.ep_rewards = ep_rewards.tolist()  # Convert numpy array to list
+        request.twtl_sat = flattened_twtl_sat
+
+        self.data_client.call_async(request)
 
 
 def main(args=None):
@@ -98,7 +144,6 @@ def main(args=None):
     except Exception as exception:
         raise exception
     else:
-        # Clean up and shutdown
         robot_ros.destroy_node()
         rclpy.shutdown()
 

@@ -1,0 +1,8 @@
+# Request part
+int32 robot_id
+int32 repeat_count
+float32[] ep_rewards  # 1-D numpy array (ep_rewards)
+uint8[] twtl_sat  # List of lists (twtl_sat)
+---
+# Response part
+bool accepted  # Indicate if the data was successfully received
