@@ -20,11 +20,13 @@ class CoordinatorROS(Node):
             allow_undeclared_parameters=True,
             automatically_declare_parameters_from_overrides=True,
         )
-        config_path = self.get_parameter('config_path').get_parameter_value().string_value
+        config_path = self.get_parameter('config_path').value
+        proj_dir = self.get_parameter('proj_dir').value
 
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
+        self.adaptive_lower_bound = config['use adaptive lower bound']
         self.num_robots = config['environment']['num_robots']
         self.des_probs = [task["desired satisfaction probability"]
                           for task in config['TWTL constraint']['tasks'].values()]
@@ -32,7 +34,7 @@ class CoordinatorROS(Node):
         self.repeat_iters = config['Q-learning config']['repeat']
         self.num_episodes = config['Q-learning config']['number of episodes']
 
-        self.coordinator = Coordinator(self.num_robots, self.num_tasks, self.des_probs)
+        self.coordinator = Coordinator(self.num_robots, self.num_tasks, self.des_probs, proj_dir)
 
         self.repeat_count = 0
         self.episode = 0
@@ -50,17 +52,17 @@ class CoordinatorROS(Node):
 
         # Publisher to send the result (task allocations) to robots
         self.publisher = self.create_publisher(TaskAllocation, 'task_allocations', 10)
-        self.string_publisher = self.create_publisher(String, 'proj_dir', 10)
+        # self.string_publisher = self.create_publisher(String, 'proj_dir', 10)
 
         # self.progress_bar = tqdm(total=self.num_episodes, desc="Progress", unit="episode")
 
         self.get_logger().info('Coordinator is ready and waiting for values from robots.')
 
-    def publish_projdir(self):
-        # Create and publish the message
-        msg = String()
-        msg.data = self.coordinator.proj_dir
-        self.string_publisher.publish(msg)
+    # def publish_projdir(self):
+    #     # Create and publish the message
+    #     msg = String()
+    #     msg.data = self.coordinator.proj_dir
+    #     self.string_publisher.publish(msg)
 
     def receive_values_callback(self, request, response):
         # Extract the robot ID and values from the request
@@ -186,7 +188,7 @@ class CoordinatorROS(Node):
             # TODO: save the results
             if self.repeat_count >= self.repeat_iters:
                 self.get_logger().info(f'Reached the desired learning episode for {self.repeat_iters} iterations')
-                self.publish_projdir()
+                # self.publish_projdir()
                 # self.plot_results()
             else:
                 self.get_logger().info(f'Reached the desired learning episode for iteration {self.repeat_count}')
@@ -204,13 +206,59 @@ class CoordinatorROS(Node):
         probabilities = np.array([[p for p in self.received_probs[i]] for i in range(self.num_robots)])
         backup_probs = np.array([[p for p in self.backup_probs[i]] for i in range(self.num_robots)])
 
-        x_values, constraint_satisfied = self.coordinator.compute_prob(values, probabilities)
+        values = np.round(values, decimals=6)
+        probabilities = np.round(probabilities, decimals=6)
+        backup_probs = np.round(backup_probs, decimals=6)
 
-        if not constraint_satisfied:
+        # x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs)
+
+        # self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
+
+        if not self.adaptive_lower_bound:
             x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs)
             if not constraint_satisfied:
-                self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
-                raise RuntimeError("Unable to find feasible task allocation.")
+                self.get_logger().info(f'Unable to find feasible solution')
+
+                # try to find a feasible initial point
+                zero_values = np.zeros_like(values)
+                x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
+                if constraint_satisfied:
+                    x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs, x_values.flatten())
+
+                # try reducing the decimals
+                if not constraint_satisfied:
+                    values = np.round(values, decimals=3)
+                    probabilities = np.round(probabilities, decimals=3)
+                    backup_probs = np.round(backup_probs, decimals=3)
+                    x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
+
+                if not constraint_satisfied:
+                    self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
+                    raise RuntimeError("Unable to find feasible task allocation.")
+        else:
+            x_values, constraint_satisfied = self.coordinator.compute_prob(values, probabilities)
+            if not constraint_satisfied:
+                x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs)
+                if not constraint_satisfied:
+                    self.get_logger().info(f'Unable to find feasible solution')
+
+                    # try to find a feasible initial point
+                    zero_values = np.zeros_like(values)
+                    x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
+                    if constraint_satisfied:
+                        x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs,
+                                                                                       x_values.flatten())
+
+                    # try reducing the decimals
+                    if not constraint_satisfied:
+                        values = np.round(values, decimals=3)
+                        probabilities = np.round(probabilities, decimals=3)
+                        backup_probs = np.round(backup_probs, decimals=3)
+                        x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
+
+                    if not constraint_satisfied:
+                        self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
+                        raise RuntimeError("Unable to find feasible task allocation.")
 
         return x_values, constraint_satisfied
 
