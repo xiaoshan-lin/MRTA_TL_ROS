@@ -26,10 +26,14 @@ def generate_launch_description():
 
     while not proj_created:
         try:
-            dt = datetime.datetime.today()
-            folder_name = simpledialog.askstring('Name your project',
-                                                 'Please enter the name of your project',
-                                                 initialvalue=f'itrs_{num_iterations}_episode_{num_episodes}')
+
+            suggested_filename = f'itrs_{num_iterations}_episode_{num_episodes}'
+            suggested_filename = f'computation_time_{num_robots}_robots'
+            folder_name = simpledialog.askstring(
+                'Name your project',
+                'Please enter the name of your project',
+                initialvalue=suggested_filename
+            )
 
             proj_dir = os.path.abspath(os.path.join(proj_dir, folder_name))
             os.mkdir(proj_dir)

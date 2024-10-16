@@ -37,6 +37,10 @@ class RobotROS(Node):
         self.num_tasks = self.robot.num_tasks
         self.client = self.create_client(RequestAllocation, 'send_values')
         self.data_client = self.create_client(SendData, 'send_data')
+        self.waiting_for_response = False
+        self.future = None
+
+        # self.timer = self.create_timer(1, self.timer_callback)
 
         # Subscriber to listen to the task allocation
         self.subscription = self.create_subscription(
@@ -60,11 +64,24 @@ class RobotROS(Node):
 
         self.get_logger().info('Connected to coordinator service')
 
+        self.robot.start_timer()
         self.send_values()
 
     # def pickle_callback(self, msg):
     #     proj_dir = msg.data
     #     self.get_logger().info(f'Robot {self.robot.robot_id} received project dir')
+
+    def timer_callback(self):
+        if self.waiting_for_response and self.future is not None:
+            if self.future.done():
+                response = self.future.result()
+                if response.accepted:
+                    self.waiting_for_response = False
+                else:
+                    self.get_logger().error(f"Request not accepted.")
+                    self.get_logger().error(f"{response.message}")
+            else:
+                self.get_logger().error(f"Response not yet received.")
 
     def send_values(self):
         values, probs, backup_probs = self.robot.get_values_and_probs()
@@ -75,7 +92,7 @@ class RobotROS(Node):
         # self.get_logger().info(f'mdp:{self.robot.current_mdp_state}')
         # self.get_logger().info(f'lb: {self.robot.estimator.lower_bound[0][self.robot.current_mdp_state]}')
         # a = self.robot.estimator.result_count[0][self.robot.current_mdp_state]['number']
-        # self.get_logger().info(f'lb: {a}')
+        # self.get_logger().info(f'Robot {self.robot.robot_id}: send values')
 
         request = RequestAllocation.Request()
         request.robot_id = self.robot.robot_id
@@ -83,7 +100,8 @@ class RobotROS(Node):
         request.robot_values = values
         request.robot_probs = probs
         request.backup_probs = backup_probs
-        self.client.call_async(request)  # Asynchronously send the service request
+        self.future = self.client.call_async(request)  # Asynchronously send the service request
+        self.waiting_for_response = True
 
     def task_allocation_callback(self, msg):
         # Convert received data to 2D NumPy array (assume known shape)
@@ -106,12 +124,16 @@ class RobotROS(Node):
                 self.send_results()
                 if status == 'Iteration end':
                     self.get_logger().info(f'Reached the desired learning episode for iteration {self.robot.repeat_count}')
+                    self.robot.stop_timer()
                     self.robot.pickle()
                     self.reset()
+                    self.robot.start_timer()
                     self.send_values()
                 else:
                     self.get_logger().info(f'Reached the desired learning episode for {self.robot.repeat_iters} iterations')
+                    self.robot.stop_timer()
                     self.robot.pickle()
+
         else:
             raise RuntimeError("Unalbe to find feasible task allocation.")
 
