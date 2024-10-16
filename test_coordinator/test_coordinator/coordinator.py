@@ -7,10 +7,8 @@ import rclpy
 from rclpy.node import Node
 from test_interfaces.srv import RequestAllocation, SendData  # Custom service with robot_id and float array
 from test_interfaces.msg import TaskAllocation
-from std_msgs.msg import String
 
-from tqdm import tqdm
-import sys
+from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy
 
 
 class CoordinatorROS(Node):
@@ -34,35 +32,55 @@ class CoordinatorROS(Node):
         self.repeat_iters = config['Q-learning config']['repeat']
         self.num_episodes = config['Q-learning config']['number of episodes']
 
+        self.method = config['method']
+
         self.coordinator = Coordinator(self.num_robots, self.num_tasks, self.des_probs, proj_dir)
 
         self.repeat_count = 0
         self.episode = 0
+        self.previous_episode = 0
         self.received_values = {}  # Store values from each robot by ID
         self.received_probs = {}
         self.backup_probs = {}
         self.received_rewards = {}
         self.received_twtl_sat = {}
+        self.received_values_from = []
+        self.not_received_from = []
 
         self.thread_pool_executor = ThreadPoolExecutor()
 
+        qos_profile = QoSProfile(
+            history=HistoryPolicy.KEEP_ALL,  # Store all requests/messages
+            reliability=ReliabilityPolicy.RELIABLE  # Ensure reliable communication
+        )
+
         # ROS2 service to receive values from robots
-        self.srv = self.create_service(RequestAllocation, 'send_values', self.receive_values_callback)
-        self.data_srv = self.create_service(SendData, 'send_data', self.receive_data_callback)
+        self.srv = self.create_service(
+            RequestAllocation,
+            'send_values',
+            self.receive_values_callback,
+            qos_profile=qos_profile)
+        self.data_srv = self.create_service(
+            SendData,
+            'send_data',
+            self.receive_data_callback,
+            qos_profile=qos_profile
+        )
 
         # Publisher to send the result (task allocations) to robots
         self.publisher = self.create_publisher(TaskAllocation, 'task_allocations', 10)
-        # self.string_publisher = self.create_publisher(String, 'proj_dir', 10)
 
-        # self.progress_bar = tqdm(total=self.num_episodes, desc="Progress", unit="episode")
+        # self.timer = self.create_timer(1, self.timer_callback)
 
         self.get_logger().info('Coordinator is ready and waiting for values from robots.')
 
-    # def publish_projdir(self):
-    #     # Create and publish the message
-    #     msg = String()
-    #     msg.data = self.coordinator.proj_dir
-    #     self.string_publisher.publish(msg)
+    # def timer_callback(self):
+    #     if self.episode == self.previous_episode:
+    #         self.get_logger().info(f"Currently received {len(self.received_values)} from {self.received_values_from}")
+    #         self.get_logger().info(f"Received value dict {self.received_values}")
+    #
+    #     else:
+    #         self.previous_episode = self.episode
 
     def receive_values_callback(self, request, response):
         # Extract the robot ID and values from the request
@@ -83,6 +101,7 @@ class CoordinatorROS(Node):
             self.received_values[robot_id] = robot_values
             self.received_probs[robot_id] = robot_probs
             self.backup_probs[robot_id] = backup_probs
+            self.received_values_from.append(robot_id)
 
             message, accepted = f'Received values from Robot {robot_id}', True
             # Check if all robots have sent their values
@@ -90,6 +109,7 @@ class CoordinatorROS(Node):
                 # Run task allocation asynchronously
                 future = self.thread_pool_executor.submit(self.compute_prob)
                 future.add_done_callback(self.publish_task_allocation)
+                self.received_values_from = []
 
         else:
             message, accepted = '', False
@@ -98,6 +118,9 @@ class CoordinatorROS(Node):
                            f'but the current episode accepted is {self.episode}'
             if received:
                 message += f'Values from Robot {robot_id} for episode {episode} already received'
+                self.get_logger().info(message)
+                self.get_logger().info(f"Currently received {len(self.received_values)} from {self.received_values_from}")
+                self.get_logger().info(f"Received value dict {self.received_values}")
 
             if id_exceed_maximum:
                 message += f'Robot {robot_id} exceeds the maximum number of robots'
@@ -173,23 +196,23 @@ class CoordinatorROS(Node):
         msg.x_values = x_values.flatten().tolist()  # Flatten and convert to list
 
         msg.constraint_satisfied = bool(constraint_satisfied)
+
+        self.received_values.clear()
+        self.received_probs.clear()
+        self.backup_probs.clear()
+
         self.publisher.publish(msg)
 
         # Clear the received values for the next round
         self.episode += 1
         self.get_logger().info(f'Episode: {self.episode}')
 
-        self.received_values.clear()
-        self.received_probs.clear()
-        self.backup_probs.clear()
-
         if self.episode >= self.num_episodes:
             self.repeat_count += 1
             # TODO: save the results
             if self.repeat_count >= self.repeat_iters:
                 self.get_logger().info(f'Reached the desired learning episode for {self.repeat_iters} iterations')
-                # self.publish_projdir()
-                # self.plot_results()
+                self.coordinator.pickle()
             else:
                 self.get_logger().info(f'Reached the desired learning episode for iteration {self.repeat_count}')
                 self.reset()  # reset and wait for the next iteration
@@ -206,61 +229,13 @@ class CoordinatorROS(Node):
         probabilities = np.array([[p for p in self.received_probs[i]] for i in range(self.num_robots)])
         backup_probs = np.array([[p for p in self.backup_probs[i]] for i in range(self.num_robots)])
 
-        values = np.round(values, decimals=6)
-        probabilities = np.round(probabilities, decimals=6)
-        backup_probs = np.round(backup_probs, decimals=6)
-
-        # x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs)
-
-        # self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
-
-        if not self.adaptive_lower_bound:
-            x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs)
-            if not constraint_satisfied:
-                self.get_logger().info(f'Unable to find feasible solution')
-
-                # try to find a feasible initial point
-                zero_values = np.zeros_like(values)
-                x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
-                if constraint_satisfied:
-                    x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs, x_values.flatten())
-
-                # try reducing the decimals
-                if not constraint_satisfied:
-                    values = np.round(values, decimals=3)
-                    probabilities = np.round(probabilities, decimals=3)
-                    backup_probs = np.round(backup_probs, decimals=3)
-                    x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
-
-                if not constraint_satisfied:
-                    self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
-                    raise RuntimeError("Unable to find feasible task allocation.")
-        else:
-            x_values, constraint_satisfied = self.coordinator.compute_prob(values, probabilities)
-            if not constraint_satisfied:
-                x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs)
-                if not constraint_satisfied:
-                    self.get_logger().info(f'Unable to find feasible solution')
-
-                    # try to find a feasible initial point
-                    zero_values = np.zeros_like(values)
-                    x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
-                    if constraint_satisfied:
-                        x_values, constraint_satisfied = self.coordinator.compute_prob(values, backup_probs,
-                                                                                       x_values.flatten())
-
-                    # try reducing the decimals
-                    if not constraint_satisfied:
-                        values = np.round(values, decimals=3)
-                        probabilities = np.round(probabilities, decimals=3)
-                        backup_probs = np.round(backup_probs, decimals=3)
-                        x_values, constraint_satisfied = self.coordinator.compute_prob(zero_values, backup_probs)
-
-                    if not constraint_satisfied:
-                        self.get_logger().info(f'Probability: {backup_probs}; values: {values}')
-                        raise RuntimeError("Unable to find feasible task allocation.")
-
-        return x_values, constraint_satisfied
+        return self.coordinator.compute_prob(
+            values,
+            probabilities,
+            backup_probs,
+            self.method,
+            self.adaptive_lower_bound
+        )
 
     def reset(self):
         self.episode = 0
